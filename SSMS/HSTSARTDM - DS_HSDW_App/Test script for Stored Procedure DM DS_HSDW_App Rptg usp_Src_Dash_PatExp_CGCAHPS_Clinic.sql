@@ -40,6 +40,7 @@ MODS (copied from HCAHPS procs, still relevant to CGCAHPS):
 	02/12/2018 - CM:  Pull Therapies Operational Service Line Where applicable as Service Line
     09/30/2019 - TMB: changed logic that assigns targets to domains
 	11/19/2019 - TMB: Remove restrictions for discharge date range
+	01/16/2019 - TMB: Optimize code for better performance
 *********************************************************************************************/
 SET NOCOUNT ON
 
@@ -64,6 +65,9 @@ DECLARE @currdate AS DATE;
 DECLARE @startdate AS DATE;
 DECLARE @enddate AS DATE;
 
+SET @startdate = '7/1/2019'
+SET @enddate = '6/30/2020'
+
 
     SET @currdate=CAST(GETDATE() AS DATE);
 
@@ -75,6 +79,11 @@ DECLARE @enddate AS DATE;
         END; 
 
 ----------------------------------------------------
+DECLARE @locstartdate SMALLDATETIME,
+        @locenddate SMALLDATETIME
+
+SET @locstartdate = @startdate
+SET @locenddate   = @enddate
 
 SELECT
 	SURVEY_ID
@@ -95,6 +104,11 @@ WHERE sk_Dim_PG_Question IN
 	'801','803','805','807','809','851','853','904','905','924','928','1256','1257','1259','725',
 	'735','737','739','750','752','754','756','758','743','913','919','915','916','766','768','770','772','780','782','778'
 )
+AND RECDATE BETWEEN @locstartdate AND @locenddate
+ORDER BY sk_Dim_PG_Question, RECDATE, SURVEY_ID
+
+  -- Create index for temp table #cgcahps_resp
+  CREATE CLUSTERED INDEX IX_cgcahps_resp ON #cgcahps_resp (sk_Dim_PG_Question, RECDATE, SURVEY_ID)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -109,6 +123,7 @@ SELECT DISTINCT
 	 ,clinictemp.Phys_Div
 	 ,clinictemp.sk_Dim_Clrt_DEPt
 	 ,loc_master.EPIC_DEPARTMENT_ID
+	 ,loc_master.epic_department_name
 	 ,loc_master.SERVICE_LINE_ID
 	 ,CASE WHEN loc_master.opnl_service_name = 'Therapies' AND (loc_master.service_line IS NULL OR loc_master.SERVICE_LINE = 'Unknown') THEN 'Therapies'
 		   WHEN loc_master.service_line IS NULL OR loc_master.service_line = 'Unknown' THEN 'Other'
@@ -236,6 +251,20 @@ LEFT OUTER JOIN
 	) MDM -- MDM_epicsvc view doesn't include sub service line
 	ON loc_master.epic_department_id = MDM.[EPIC_DEPARTMENT_ID]
 
+--SELECT DISTINCT
+--	REC_FY,
+--    sk_Dim_Clrt_DEPt,
+--    epic_department_id,
+--    epic_department_name,
+--    service_line_id,
+--    SERVICE_LINE,
+--    SUB_SERVICE_LINE,
+--    CLINIC,
+--    DOMAIN,
+--    Domain_Goals
+--FROM #surveys_op
+--ORDER BY REC_FY, SERVICE_LINE, epic_department_name
+
 ------------------------------------------------------------------------------------------
 
 -- JOIN TO DIM_DATE
@@ -252,6 +281,7 @@ LEFT OUTER JOIN
 	,VARNAME
 	,QUESTION_TEXT_ALIAS
 	,#surveys_op.EPIC_DEPARTMENT_ID
+	,#surveys_op.epic_department_name
 	,SERVICE_LINE_ID
 	,#surveys_op.SERVICE_LINE
 	,sub_service_line
@@ -281,20 +311,31 @@ LEFT OUTER JOIN
 	,rec.month_short_name
 INTO #surveys_op2
 FROM
-	(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date >= @startdate AND day_date <= @enddate) rec
+	(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date >= @locstartdate AND day_date <= @locenddate) rec
 LEFT OUTER JOIN #surveys_op
 ON rec.day_date = #surveys_op.RECDATE
---FULL OUTER JOIN
---	(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date >= @startdate AND day_date <= @enddate) dis -- Need to report by both the discharge date on the survey as well as the received date of the survey
---ON dis.day_date = #surveys_op.DISDATE
 FULL OUTER JOIN
-	(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date <= @enddate) dis -- Need to report by both the discharge date on the survey as well as the received date of the survey
+	(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date <= @locenddate) dis -- Need to report by both the discharge date on the survey as well as the received date of the survey
 ON dis.day_date = #surveys_op.DISDATE
 LEFT OUTER JOIN
-	(SELECT * FROM DS_HSDW_App.Rptg.CGCAHPS_Goals WHERE UNIT = 'All Clinics') goals -- CHANGE BASED ON GOALS FROM BUSH - CREATE NEW CGCAHPS_Goals
+	(SELECT * FROM DS_HSDW_App.Rptg.CGCAHPS_Goals_Test WHERE UNIT = 'All Clinics') goals -- CHANGE BASED ON GOALS FROM BUSH - CREATE NEW CGCAHPS_Goals
 ON #surveys_op.REC_FY = goals.GOAL_FISCAL_YR AND #surveys_op.Service_Line = goals.SERVICE_LINE AND #surveys_op.Domain_Goals = goals.DOMAIN  -- THIS IS SERVICE LINE LEVEL, USE THE SERVICE-LINE SPECIFIC GOAL, DENOTED BY UNIT "ALL CLINICS" (ALL UNITS W/I SERVICE LINE GET THE GOAL)
 ORDER BY Event_Date, SURVEY_ID, sk_Dim_PG_Question
 
+--SELECT DISTINCT
+--	SERVICE_LINE
+--   ,service_line_id
+--   ,epic_department_id
+--   ,epic_department_name
+--   ,CLINIC
+--   ,DOMAIN
+--   ,Domain_Goals
+--   ,GOAL
+--FROM #surveys_op2
+--WHERE Domain_Goals IS NOT NULL
+--ORDER BY SERVICE_LINE
+--       , epic_department_id
+--	   , Domain_Goals
 ----------------------------------------------------------------------------------------------------------------------------------------------------
 
 -- SELF UNION TO ADD AN "All Clinics" CLINIC
@@ -317,6 +358,7 @@ UNION ALL
 		,VARNAME
 		,QUESTION_TEXT_ALIAS
 		,#surveys_op.EPIC_DEPARTMENT_ID
+		,#surveys_op.epic_department_name
 		,SERVICE_LINE_ID
 		,#surveys_op.SERVICE_LINE
 		,sub_service_line
@@ -346,22 +388,33 @@ UNION ALL
 		,rec.quarter_name
 		,rec.month_short_name
 	FROM
-	(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date >= @startdate AND day_date <= @enddate) rec
+	(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date >= @locstartdate AND day_date <= @locenddate) rec
 	LEFT OUTER JOIN #surveys_op
 	ON rec.day_date = #surveys_op.RECDATE
-	--FULL OUTER JOIN
-	--	(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date >= @startdate AND day_date <= @enddate) dis -- Need to report by both the discharge date on the survey as well as the received date of the survey
-	--ON dis.day_date = #surveys_op.DISDATE
 	FULL OUTER JOIN
-		(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date <= @enddate) dis -- Need to report by both the discharge date on the survey as well as the received date of the survey
+		(SELECT * FROM DS_HSDW_Prod.dbo.Dim_Date WHERE day_date <= @locenddate) dis -- Need to report by both the discharge date on the survey as well as the received date of the survey
 	ON dis.day_date = #surveys_op.DISDATE
 	LEFT OUTER JOIN 
-		(SELECT * FROM DS_HSDW_App.Rptg.CGCAHPS_Goals WHERE UNIT = 'All Clinics') goals
+		(SELECT * FROM DS_HSDW_App.Rptg.CGCAHPS_Goals_Test WHERE UNIT = 'All Clinics') goals
 		ON #surveys_op.REC_FY = goals.GOAL_FISCAL_YR AND #surveys_op.Domain_Goals = goals.DOMAIN AND goals.SERVICE_LINE = #surveys_op.SERVICE_LINE 
-	--WHERE (dis.day_date >= @startdate AND DIS.day_date <= @enddate) AND (rec.day_date >= @startdate AND rec.day_date <= @enddate)
-	WHERE (rec.day_date >= @startdate AND rec.day_date <= @enddate)
-)																							
+	WHERE (rec.day_date >= @locstartdate AND rec.day_date <= @locenddate)
+)
 
+--SELECT DISTINCT
+--	SERVICE_LINE
+--   ,service_line_id
+--   ,epic_department_id
+--   ,epic_department_name
+--   ,CLINIC
+--   ,DOMAIN
+--   ,Domain_Goals
+--   ,GOAL
+--FROM #surveys_op3
+--WHERE Domain_Goals IS NOT NULL
+--ORDER BY SERVICE_LINE
+--       , CLINIC
+--       , epic_department_id
+--	   , Domain_Goals																						
 ----------------------------------------------------------------------------------------------------------------------
 -- RESULTS
 
@@ -386,6 +439,7 @@ SELECT
 		END AS SERVICE_LINE
 	,Sub_Service_Line
 	,epic_department_id
+	,epic_department_name
 	,service_line_id
 	,[sk_Fact_Pt_Acct]
 	,[Rpt_Prd]
@@ -418,49 +472,84 @@ SELECT
 	,[VAL_COUNT]
 	,[quarter_name]
 	,[month_short_name]
+
 INTO #CGCAHPS_Clinics
+
 FROM #surveys_op3
 
-SELECT mdm.hs_area_id, mdm.hs_area_name, resp.*
-FROM #CGCAHPS_Clinics resp
-LEFT OUTER JOIN DS_HSDW_Prod.Rptg.vwRef_MDM_Location_Master_EpicSvc mdm
-ON mdm.epic_department_id = resp.epic_department_id
-WHERE Domain_Goals IS NOT NULL AND Domain_Goals <> 'Additional Questions About Your Care'
-ORDER BY Event_FY, Event_Date, SURVEY_ID, CLINIC, Domain_Goals, sk_Dim_PG_Question
-
---SELECT Event_Type
---     , Event_FY
---	 , month_short_name
---	 , SERVICE_LINE
---	 , CLINIC
---     , epic_department_id
---	 , Domain_Goals
---	 , sk_Dim_PG_Question
---	 , SUM(TOP_BOX) AS TOP_BOX
---	 , SUM(VAL_COUNT) AS VAL_COUNT
---FROM #CGCAHPS_Clinics
---WHERE Domain_Goals IS NOT NULL AND Domain_Goals <> 'Additional Questions About Your Care'
---AND Event_FY = 2019
---AND Event_Date BETWEEN '7/1/2018 00:00 AM' AND '7/31/2018 11:59 PM'
-----AND CLINIC <> 'All Clinics'
---GROUP BY
---	Event_Type
---  , Event_FY
---  , month_short_name
---  , SERVICE_LINE
---  , CLINIC
---  , epic_department_id
---  , Domain_Goals
---  , sk_Dim_PG_Question
---ORDER BY
---	Event_Type
---  , Event_FY
---  , month_short_name
---  , SERVICE_LINE
---  , CLINIC
---  , epic_department_id
---  , Domain_Goals
---  , sk_Dim_PG_Question
+--SELECT SERVICE_LINE,
+--       SURVEY_ID,
+--       CLINIC,
+--       Domain_Goals,
+--       sk_Dim_PG_Question,
+--       epic_department_id,
+--       epic_department_name,
+--       Event_Type,
+--       SUB_SERVICE_LINE,
+--       service_line_id,
+--       sk_Fact_Pt_Acct,
+--       Rpt_Prd,
+--       Event_Date,
+--       Event_Date_Disch,
+--       Event_FY,
+--       VARNAME,
+--       QUESTION_TEXT_ALIAS,
+--       DOMAIN,
+--       Recvd_Date,
+--       Discharge_Date,
+--       Patient_ID,
+--       Pat_Name,
+--       Pat_Sex,
+--       PAT_DOB,
+--       Pat_Age,
+--       Pat_Age_Survey_Recvd,
+--       Pat_Age_Survey_Answer,
+--       Peds,
+--       NPINumber,
+--       Phys_Name,
+--       Phys_Dept,
+--       Phys_Div,
+--       GOAL,
+--       VALUE,
+--       Value_Resp_Grp,
+--       TOP_BOX,
+--       VAL_COUNT,
+--       quarter_name,
+--       month_short_name
+SELECT DISTINCT
+	SERVICE_LINE,
+    SUB_SERVICE_LINE,
+	epic_department_id,
+	epic_department_name,
+	CLINIC,
+    DOMAIN,
+    Domain_Goals,
+    GOAL
+FROM #CGCAHPS_Clinics
+WHERE Domain_Goals IS NOT NULL
+AND GOAL IS NOT NULL
+--ORDER BY SERVICE_LINE
+--       , Domain_Goals
+--ORDER BY SERVICE_LINE
+--       , CLINIC
+--       , epic_department_id
+--	   , Domain_Goals
+--ORDER BY SERVICE_LINE
+--       , SURVEY_ID
+--       , CLINIC
+--	   , Domain_Goals
+--	   , sk_Dim_PG_Question	
+--       , epic_department_id
+--ORDER BY CLINIC
+--       , SERVICE_LINE
+--       , SURVEY_ID
+--	   , Domain_Goals
+--	   , sk_Dim_PG_Question	
+--       , epic_department_id
+ORDER BY SERVICE_LINE
+       , CLINIC
+       , epic_department_id
+	   , Domain_Goals	
 
 GO
 
